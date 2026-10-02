@@ -1,0 +1,15 @@
+# Worktree tạm của Claude Code — bản sao repo, không commit
+.claude/worktrees/
+**/.claude/worktrees/
+
+# Cài đặt editor cá nhân
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Bí mật
+.env

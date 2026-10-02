@@ -1,0 +1,14 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+google-genai>=0.3
+google-auth>=2.35
+google-api-python-client>=2.149
+google-cloud-firestore>=2.29
+google-cloud-tasks>=2.16
+# Dò chuyển cảnh để chuẩn hoá mốc scene - xem app/scene_refiner.py.
+# Không ghim opencv-python-headless ở đây: scenedetect khai báo phụ thuộc opencv-python (bản đầy
+# đủ) nên pip sẽ cài cả hai, tốn thêm ~120MB image mà "import cv2" vẫn lấy bản đầy đủ. Thư viện
+# hệ thống mà bản đầy đủ cần đã được cài trong Dockerfile.
+scenedetect>=0.6.4

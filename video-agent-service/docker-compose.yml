@@ -1,0 +1,14 @@
+services:
+  video-agent-service:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      # Trỏ tới service account JSON key mount ở dưới - dùng để Firestore Client
+      # xác thực với GCP thật. Bỏ dòng này (và volume bên dưới) nếu dùng Firestore
+      # Emulator thay vì GCP project thật - xem README.md.
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/firestore-key.json
+    volumes:
+      - ./secrets/firestore-key.json:/secrets/firestore-key.json:ro

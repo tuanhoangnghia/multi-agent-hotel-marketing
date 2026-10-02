@@ -1,0 +1,265 @@
+name: Deploy to Cloud Run
+
+# Push lên main -> chạy test -> build image -> push Artifact Registry -> deploy.
+# Cờ deploy ở job "deploy" phải khớp với scripts/deploy.sh; sửa một bên thì
+# sửa cả bên kia, nếu không deploy tay và deploy tự động sẽ cho ra hai cấu hình
+# khác nhau trên cùng một service.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Service chạy --max-instances=1 (job state nằm trong RAM, xem docs/SPEC.md §1).
+# Hai lần deploy chồng nhau sẽ thay instance giữa chừng và giết job đang chạy,
+# nên xếp hàng thay vì chạy song song — và KHÔNG cancel-in-progress, để một
+# deploy đang dở không bị bỏ giữa chừng.
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
+  SERVICE: ${{ vars.CLOUD_RUN_SERVICE || 'video-render-service' }}
+  REPO: ${{ vars.ARTIFACT_REPO || 'containers' }}
+  # Service account mà container CHẠY BẰNG (phải được share thư mục Drive).
+  RUNTIME_SA: ${{ vars.RUNTIME_SERVICE_ACCOUNT }}
+  # Thư mục Drive nhận output khi delivery.upload_to_drive=true. Để trống thì
+  # request phải tự khai delivery.drive_folder_id. PHẢI là thư mục trên Shared
+  # Drive — service account không có quota Drive, xem
+  # intake.resolve_drive_output_folder.
+  # API_KEY KHÔNG khai ở đây: nó là repo secret RENDER_API_KEY, truyền vào ở
+  # step "Deploy to Cloud Run" — xem chú thích tại đó để biết vì sao không đi
+  # qua Secret Manager nữa.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Không có ffmpeg thì tests/test_integration*.py tự skip (skipif
+      # shutil.which("ffmpeg") is None) — cài vào để chúng chạy thật.
+      #
+      # PHẢI cài đúng bộ font như Dockerfile. tests/test_integration_overlay.py
+      # đo GLYPH THẬT trên frame ffmpeg dựng ra, và filter subtitles= trong test
+      # không truyền fontsdir -> libass hỏi fontconfig của hệ thống. Thiếu
+      # Liberation Serif (mặc định subtitle.font_name) thì fontconfig âm thầm
+      # thay bằng font khác có tỉ lệ cap-height khác, và các ngưỡng pixel trong
+      # test sai ngay dù code không đổi dòng nào.
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            fonts-dejavu-core \
+            fonts-liberation2 \
+            fontconfig
+          # Không tìm thấy font là hỏng test kiểu khó đoán -> dừng ngay tại đây.
+          fc-match "Liberation Serif" | tee /dev/stderr | grep -qi liberation
+          fc-match "Liberation Sans" | tee /dev/stderr | grep -qi liberation
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        # Test tự set API_KEY/WORK_DIR qua monkeypatch (tests/api/conftest.py),
+        # không cần secret nào.
+        run: pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # bắt buộc cho Workload Identity Federation
+    steps:
+      - uses: actions/checkout@v4
+
+      # Xác thực keyless bằng Workload Identity Federation — không có key JSON
+      # nào nằm trong repo secrets. Cần tạo trước:
+      #   WIF_PROVIDER  = projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+      #   DEPLOYER_SERVICE_ACCOUNT = SA dùng để deploy (khác RUNTIME_SA)
+      # SA deploy cần: roles/run.admin, roles/artifactregistry.writer,
+      # và roles/iam.serviceAccountUser TRÊN RUNTIME_SA (để actAs khi deploy).
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.DEPLOYER_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Log in to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGION }}-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: image
+        run: |
+          BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${SERVICE}"
+          echo "sha_tag=${BASE}:${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.image.outputs.sha_tag }}
+            ${{ steps.image.outputs.latest_tag }}
+          # Layer apt-get (ffmpeg + font) nặng và gần như không đổi -> cache lại
+          # để build sau chỉ mất thời gian ở lớp pip/COPY app.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Deploy bằng tag SHA chứ không phải :latest — Cloud Run ghim đúng digest
+      # đã build ở bước trên, và rollback chỉ là deploy lại một SHA cũ.
+      #
+      # API_KEY đi qua repo secret RENDER_API_KEY, KHÔNG qua Secret Manager:
+      # không ai trong team có secretmanager.versions.access trên secret
+      # video-render-api-key, nên giá trị sinh ra lúc tạo secret không đọc lại
+      # được và cũng không thêm version mới được — key thành bất khả dụng và mọi
+      # request nhận 401 UNAUTHORIZED. Đánh đổi: key hiện nguyên văn trong
+      # `gcloud run services describe` và Cloud Console, ai có role
+      # run.viewer/run.admin cũng đọc được — đúng cái đánh đổi mà nhánh fallback
+      # của scripts/deploy.sh đã ghi. Muốn quay lại Secret Manager: xin Owner cấp
+      # roles/secretmanager.secretVersionAdder cho DEPLOYER_SERVICE_ACCOUNT rồi
+      # sửa cả step này và scripts/deploy.sh (USE_SECRET_MANAGER=1).
+      - name: Deploy to Cloud Run
+        env:
+          API_KEY: ${{ secrets.RENDER_API_KEY }}
+          # CHỈ khai ở step này, KHÔNG đưa lên khối env cấp workflow: khối đó áp
+          # cho cả job "test", và khi biến này có trong môi trường thì mọi
+          # Settings() trong test tự bật upload lên Drive -> 42 test đổ (đã đo).
+          # Id thư mục không phải secret (quyền do việc chia sẻ Drive quyết
+          # định) nên để mặc định ngay đây; khai repo variable cùng tên thì giá
+          # trị đó thắng.
+          #
+          # PHẢI là Shared Drive (id bắt đầu bằng "0A"), không phải thư mục
+          # trong My Drive. Đã đo cả hai: thư mục My Drive 1tp1dA8zEb... trả
+          # 403 storageQuotaExceeded ("Service Accounts do not have storage
+          # quota") vì file do service account sở hữu mà SA có quota bằng 0,
+          # share Editor cũng không cứu được; Shared Drive thì file thuộc về
+          # chính drive đó nên không đụng quota của SA và job chạy thành công
+          # (job e42da8ec8034).
+          DRIVE_OUTPUT_FOLDER_ID: ${{ vars.DRIVE_OUTPUT_FOLDER_ID || '0AH10f1jCd2qEUk9PVA' }}
+        run: |
+          # Thiếu key thì Settings (app/config.py) raise ngay lúc import: revision
+          # mới không bao giờ ready và CI chỉ báo "failed to start", không nói gì
+          # về API_KEY. Chặn tại đây để lỗi chỉ đúng nguyên nhân.
+          if [ -z "${API_KEY}" ]; then
+            echo "::error::Thiếu repo secret RENDER_API_KEY (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+          # Chuyển secret binding -> env var phải làm bằng HAI lệnh. Một lệnh thì
+          # không được: gcloud áp _GetEnvChanges TRƯỚC _GetSecretsChanges
+          # (command_lib/run/flags.py) và EnvVarLiteralChanges chỉ ghi vào
+          # container.env_vars.literals, nên set API_KEY dạng literal khi nó còn
+          # là secret ref sẽ chết với "Cannot update environment variable
+          # [API_KEY] to string literal because it has already been set with a
+          # different type."
+          #
+          # Lệnh dưới tạo ra revision KHÔNG có API_KEY -> container không boot
+          # được và gcloud trả non-zero, nên phải "|| true". An toàn: Cloud Run
+          # không chuyển traffic sang revision chưa ready, service vẫn chạy bằng
+          # revision cũ cho tới lệnh deploy phía dưới. Chỉ chạy đúng một lần nhờ
+          # điều kiện grep. (Giả định: API_KEY là secret DUY NHẤT mà service này
+          # mount — thêm secret khác thì phải sửa lại chỗ này.)
+          if gcloud run services describe "${SERVICE}" \
+               --region="${REGION}" --project="${PROJECT_ID}" \
+               --format='value(spec.template.spec.containers[0].env)' \
+               | grep -q secretKeyRef; then
+            echo "==> Bỏ secret binding API_KEY (một lần; revision trung gian sẽ fail)"
+            gcloud run services update "${SERVICE}" \
+              --region="${REGION}" --project="${PROJECT_ID}" \
+              --clear-secrets || true
+          fi
+
+          # ^@^ đổi dấu phân tách của --set-env-vars từ "," sang "@": key do
+          # người đặt nên không loại trừ được dấu phẩy, mà dấu phẩy trong giá trị
+          # sẽ bị gcloud hiểu là bắt đầu một biến môi trường mới.
+          # Chi phi: --min-instances=0 vi do tren log 24h that la 12 job, tong 660 giay
+          # lam viec tren 86.400 giay bi tinh tien -> 0,76% duoc dung. Voi
+          # --no-cpu-throttling thi Cloud Run tinh tien theo TOAN BO thoi gian song cua
+          # instance chu khong theo request, nen minScale=1 la tra tien 24/7 cho mot
+          # instance ngoi khong.
+          #
+          # Danh doi PHAI biet: job state va output.mp4 nam trong RAM cua process (khong
+          # DB, khong GCS). Instance bi thu la mat ca record lan file, nen
+          # JOB_TTL_SECONDS=3600 khong con la loi hua giu duoc - link /download chi song
+          # toi khi Cloud Run thu instance sau luc ranh. Cach dung dung kem cau hinh nay
+          # la bat delivery.upload_to_drive de lay file ra khoi RAM ngay roi tich hop
+          # bang link Drive. Ai van can link /download song du mot gio thi phai quay lai
+          # --min-instances=1 va tra tien cho no.
+          #
+          # Vi sao KHONG ha --cpu: encode la CPU-bound nen 2 vCPU chi chay lau gap doi
+          # voi dung cung so vCPU-giay -> gan nhu khong tiet kiem, ma cold start va moi
+          # job deu cham di. Nguoc lai memory tinh theo GiB-giay bat ke co dung hay
+          # khong, nen ha memory moi la tiet kiem that.
+          #
+          # --memory=16Gi di cung MAX_DOWNLOAD_MB=4096. TUNG ha xuong 4Gi/1024 va do la SAI:
+          # job 3edfe19c0fd4 (12 clip, canvas 1080x1920, 4 nguon) bi ffmpeg thoat voi ma -9,
+          # tuc SIGKILL cua cgroup OOM killer. Cloud Run KHONG ghi dong "Memory limit
+          # exceeded" trong ca nay vi no chi giet tien trinh con to nhat (ffmpeg) chu khong
+          # ha ca container, nen dau hieu duy nhat la ma -9.
+          #
+          # Ly do sizing hong: toi tinh memory theo kich thuoc FILE trong /tmp (85,7 MiB
+          # nguon + 19,3 MiB merged + 13,2 MiB output = ~118 MiB) va bo qua working set cua
+          # chinh ffmpeg. build_concat_command mo MOT filter_complex voi tat ca cac doan,
+          # tuc 12 input dong thoi (cung mot file duoc mo nhieu lan) = 12 decoder h264 1080p
+          # cung luc, moi decoder giu DPB toi 16 frame x 2,97 MiB, lai nhan them vi
+          # frame-threading theo so vCPU. Job 2 clip o 716x1280 ma toi do luc chon 4Gi khong
+          # he dai dien cho tai that.
+          #
+          # Va ha memory gan nhu KHONG tiet kiem gi khi da co --min-instances=0: memory chi
+          # bi tinh trong luc job chay (~30-90 giay/job), con khoan 24/7 cho instance ngoi
+          # khong da bien mat cung voi minScale. Doi lai la vo tai that -> khong danh doi.
+          gcloud run deploy "${SERVICE}" \
+            --image="${{ steps.image.outputs.sha_tag }}" \
+            --region="${REGION}" \
+            --project="${PROJECT_ID}" \
+            --platform=managed \
+            --service-account="${RUNTIME_SA}" \
+            --execution-environment=gen2 \
+            --cpu=4 \
+            --memory=16Gi \
+            --cpu-boost \
+            --no-cpu-throttling \
+            --timeout=3600 \
+            --concurrency=20 \
+            --min-instances=0 \
+            --max-instances=1 \
+            --allow-unauthenticated \
+            --set-env-vars="^@^WORK_DIR=/tmp/jobs@MAX_DOWNLOAD_MB=4096@MAX_FOLDER_VIDEOS=30@MAX_CONCURRENT_JOBS=1@JOB_TTL_SECONDS=3600@LOG_LEVEL=INFO@DRIVE_OUTPUT_FOLDER_ID=${DRIVE_OUTPUT_FOLDER_ID}@API_KEY=${API_KEY}"
+
+      # Không có bước kiểm sau deploy: /healthz (SPEC §3.5) KHÔNG gọi được trên
+      # Cloud Run — frontend của Google nuốt đúng path đó và trả 404 HTML của
+      # chính nó, request không bao giờ tới container. Đã đo trên service thật:
+      # /healthz -> 404 từ Google (không có header x-cloud-trace-context), trong
+      # khi /healthzz, /health, /Healthz, /api/healthz đều tới được app và nhận
+      # 404 JSON của FastAPI. Route trong app vẫn đăng ký đúng, có mặt trong
+      # /openapi.json — chỉ là không ai gọi tới được từ bên ngoài.
+      #
+      # Muốn có lại bước kiểm thì phải nhắm vào path khác (/openapi.json trả
+      # 200, hoặc /api/jobs không kèm key trả 401), vì mọi lần curl /healthz đều
+      # đỏ dù service hoàn toàn khoẻ.
+      - name: Show service URL
+        run: |
+          gcloud run services describe "${SERVICE}" \
+            --region="${REGION}" --project="${PROJECT_ID}" --format='value(status.url)'
